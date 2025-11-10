@@ -1,93 +1,95 @@
 import os
-import asyncio
-import tempfile
-import shutil
-from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, request
 from pyrogram import Client, filters
 import yt_dlp
-from flask import Flask
 
-# --- Web server for Render free plan ---
-app_web = Flask(__name__)
-
-@app_web.route("/")
-def home():
-    return "Bot is running!"
-
-# ---------------- Telegram Bot ----------------
-
+# --- تنظیمات از محیط ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID_ENV = os.getenv("API_ID")
+API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")   # مثل: https://yourapp.onrender.com/webhook
 
-API_ID = int(API_ID_ENV) if API_ID_ENV else None
+app = Flask(__name__)
 
-client_kwargs = {"bot_token": BOT_TOKEN}
-if API_ID and API_HASH:
-    client_kwargs["api_id"] = API_ID
-    client_kwargs["api_hash"] = API_HASH
+bot = Client(
+    "bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-app = Client("ytbot", **client_kwargs)
 
-executor = ThreadPoolExecutor(max_workers=2)
+# ---- وقتی تلگرام پیام می‌فرستد ----
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = request.get_json()
+    bot.process_update(update)
+    return "OK", 200
 
-def _sync_download(url: str, only_audio: bool, out_dir: str):
-    opts = {
-        "format": "bestaudio" if only_audio else "best",
-        "outtmpl": os.path.join(out_dir, "%(title)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    if only_audio:
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        fn = ydl.prepare_filename(info)
-        if only_audio:
-            fn = fn.rsplit(".", 1)[0] + ".mp3"
-        return fn
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Telegram Bot Active", 200
 
-async def download_media(url, only_audio):
-    tmp = tempfile.mkdtemp()
-    loop = asyncio.get_event_loop()
-    try:
-        filepath = await loop.run_in_executor(executor, _sync_download, url, only_audio, tmp)
-        return filepath, tmp
-    except:
-        shutil.rmtree(tmp)
-        raise
 
-@app.on_message(filters.private & filters.command("start"))
-async def start(_, m):
-    await m.reply_text("✅ سلام! لینک یوتیوب بفرست. برای فقط صدا بنویس: صدا")
+# ---- دستور دانلود ویدئو / صدا ----
+@bot.on_message(filters.private & filters.text)
+async def download_handler(client, message):
+    url = message.text.strip()
 
-@app.on_message(filters.private & filters.text)
-async def dl(_, m):
-    txt = m.text.strip().lower()
-    if not txt.startswith("http"):
-        return await m.reply("لینک معتبر نیست.")
-
-    only_audio = ("صدا" in txt) or ("audio" in txt)
-    msg = await m.reply("⏳ درحال دانلود...")
+    msg = await message.reply("⏳ در حال پردازش...")
 
     try:
-        file, tmp = await download_media(txt, only_audio)
-        if only_audio:
-            await m.reply_audio(file)
-        else:
-            await m.reply_video(file)
-        await msg.delete()
-        shutil.rmtree(tmp)
+        # تنظیم دانلود
+        ydl_opts = {
+            "outtmpl": "%(title)s.%(ext)s",
+            "format": "best",
+        }
+
+        # اگر کاربر گفت "صدا"
+        if "audio" in url or "voice" in url:
+            ydl_opts["format"] = "bestaudio/best"
+            ydl_opts["postprocessors"] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+            url = url.replace("audio ", "").replace("voice ", "")
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_name = ydl.prepare_filename(info)
+
+        await msg.edit("✅ ارسال فایل...")
+
+        await client.send_document(
+            chat_id=message.chat.id,
+            document=file_name
+        )
+
+        os.remove(file_name)
+
     except Exception as e:
         await msg.edit(f"❌ خطا: {e}")
 
+
+# ---- اجرای Bot + Webhook ----
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=lambda: app_web.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))).start()
-    app.run()
+    import asyncio
+    from threading import Thread
+
+    # اجرای Pyrogram در Thread جداگانه
+    def run_bot():
+        bot.run()
+
+    Thread(target=run_bot).start()
+
+    # ست کردن وب‌هوک
+    async def set_webhook():
+        async with bot:
+            await bot.set_webhook(WEBHOOK_URL)
+
+    asyncio.get_event_loop().run_until_complete(set_webhook())
+
+    # اجرای Flask
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
